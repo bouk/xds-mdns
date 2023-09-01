@@ -1,4 +1,4 @@
-module main
+module bou.ke/xds-mdns
 
 go 1.20
 
