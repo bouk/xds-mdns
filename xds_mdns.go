@@ -5,68 +5,54 @@ import (
 	"flag"
 	"fmt"
 	"net"
-	"sync"
-	"time"
+	"sort"
+	"strings"
+
+	"bou.ke/xds-mdns/dnssdbrowser"
+	"go.uber.org/zap"
+
+	"github.com/cespare/xxhash"
+	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
-	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
-	ep "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
-	lv2 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	router "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
 	hcm "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/cache/types"
-	cachev3 "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
+	"github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/resource/v3"
+	stream "github.com/envoyproxy/go-control-plane/pkg/server/stream/v3"
 	xds "github.com/envoyproxy/go-control-plane/pkg/server/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
-	"github.com/hashicorp/mdns"
-	log "github.com/sirupsen/logrus"
-	"google.golang.org/grpc"
-	"google.golang.org/protobuf/types/known/anypb"
-	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 var (
-	debug       bool
-	port        uint
-	gatewayPort uint
-	mode        string
-	version     int32
-	serviceName string
+	address string
 )
 
 func init() {
-	flag.BoolVar(&debug, "debug", true, "Use debug logging")
-	flag.UintVar(&port, "port", 18000, "Management server port")
-	flag.UintVar(&gatewayPort, "gateway", 18001, "Management server port for HTTP gateway")
-	flag.StringVar(&serviceName, "service", "", "Service name to listen to")
+	flag.StringVar(&address, "address", ":18000", "Listen address")
 }
 
 func (cb *callbacks) Report() {
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
-	log.WithFields(log.Fields{"fetches": cb.fetches, "requests": cb.requests}).Info("Report")
 }
 
 func (cb *callbacks) OnStreamOpen(ctx context.Context, id int64, typ string) error {
 	return nil
 }
 
-func (cb *callbacks) OnStreamClosed(id int64, node *corev3.Node) {}
+func (cb *callbacks) OnStreamClosed(id int64, node *core.Node) {}
 
 func (cb *callbacks) OnStreamRequest(id int64, r *discovery.DiscoveryRequest) error {
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
 	cb.requests++
-	if cb.signal != nil {
-		close(cb.signal)
-		cb.signal = nil
-	}
 	return nil
 }
 
@@ -75,19 +61,13 @@ func (cb *callbacks) OnStreamResponse(ctx context.Context, id int64, req *discov
 }
 
 func (cb *callbacks) OnFetchRequest(ctx context.Context, req *discovery.DiscoveryRequest) error {
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
 	cb.fetches++
-	if cb.signal != nil {
-		close(cb.signal)
-		cb.signal = nil
-	}
 	return nil
 }
 
 func (cb *callbacks) OnFetchResponse(req *discovery.DiscoveryRequest, resp *discovery.DiscoveryResponse) {
 }
-func (cb *callbacks) OnDeltaStreamClosed(id int64, node *corev3.Node) {}
+func (cb *callbacks) OnDeltaStreamClosed(id int64, node *core.Node) {}
 func (cb *callbacks) OnDeltaStreamOpen(ctx context.Context, id int64, typ string) error {
 	return nil
 }
@@ -100,155 +80,191 @@ func (c *callbacks) OnStreamDeltaResponse(i int64, request *discovery.DeltaDisco
 }
 
 type callbacks struct {
-	signal   chan struct{}
 	fetches  int
 	requests int
-	mu       sync.Mutex
 }
 
 const grpcMaxConcurrentStreams = 1000
 
-// RunManagementServer starts an xDS server at the given port.
-func RunManagementServer(ctx context.Context, server xds.Server, port uint) {
+// runServer starts an xDS server at the given port.
+func runServer(ctx context.Context, server xds.Server) error {
 	var grpcOptions []grpc.ServerOption
 	grpcOptions = append(grpcOptions, grpc.MaxConcurrentStreams(grpcMaxConcurrentStreams))
 	grpcServer := grpc.NewServer(grpcOptions...)
 
-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	lis, err := net.Listen("tcp", address)
 	if err != nil {
-		log.WithError(err).Fatal("failed to listen")
+		return err
 	}
 
 	// register services
 	discovery.RegisterAggregatedDiscoveryServiceServer(grpcServer, server)
 
-	log.WithFields(log.Fields{"port": port}).Info("management server listening")
 	go func() {
-		if err = grpcServer.Serve(lis); err != nil {
-			log.Error(err)
-		}
+		<-ctx.Done()
+		grpcServer.GracefulStop()
 	}()
-	<-ctx.Done()
-
-	grpcServer.GracefulStop()
+	return grpcServer.Serve(lis)
 }
 
-type OneHash struct{}
-
-func (OneHash) ID(node *core.Node) string {
-	return ""
+type cach struct {
+	browser *dnssdbrowser.Browser
+	log     *zap.Logger
 }
 
-func main() {
-	flag.Parse()
-	if serviceName == "" {
-		log.Fatal("service name is required")
-	}
+func (*cach) CreateDeltaWatch(req *discovery.DeltaDiscoveryRequest, state stream.StreamState, resp chan cache.DeltaResponse) (cancel func()) {
+	// TODO
+	return nil
+}
 
-	if debug {
-		log.SetLevel(log.DebugLevel)
-	}
-
-	listenerName := serviceName
-	routeConfigName := serviceName + "-route"
-	clusterName := serviceName + "-cluster"
-	virtualHostName := serviceName + "-vs"
-
-	ctx := context.Background()
-
-	log.Printf("Starting control plane")
-
-	signal := make(chan struct{})
-	cb := &callbacks{
-		signal:   signal,
-		fetches:  0,
-		requests: 0,
-	}
-	cache := cachev3.NewSnapshotCache(true, OneHash{}, nil)
-	srv := xds.NewServer(ctx, cache, cb)
-
-	go RunManagementServer(ctx, srv, port)
-
-	mdnsService := "_" + serviceName + "._tcp"
-	for {
-		entries := make(chan *mdns.ServiceEntry, 10)
-
-		done := make(chan bool)
-		var lbendpoints []*ep.LbEndpoint
-		go func() {
-			for entry := range entries {
-				lbendpoints = append(lbendpoints, &ep.LbEndpoint{
-					HostIdentifier: &ep.LbEndpoint_Endpoint{
-						Endpoint: &ep.Endpoint{
-							Address: &core.Address{
-								Address: &core.Address_SocketAddress{
-									SocketAddress: &core.SocketAddress{
-										Address:  entry.AddrV4.String(),
-										Protocol: core.SocketAddress_TCP,
-										PortSpecifier: &core.SocketAddress_PortValue{
-											PortValue: uint32(entry.Port),
-										},
+func servicesToClusterLoadAssignment(name string, services []dnssdbrowser.Service) *endpoint.ClusterLoadAssignment {
+	endpoints := make([]*endpoint.LbEndpoint, 0, len(services))
+	for _, svc := range services {
+		for _, address := range svc.Addresses {
+			endpoints = append(endpoints, &endpoint.LbEndpoint{
+				HostIdentifier: &endpoint.LbEndpoint_Endpoint{
+					Endpoint: &endpoint.Endpoint{
+						Address: &core.Address{
+							Address: &core.Address_SocketAddress{
+								SocketAddress: &core.SocketAddress{
+									Address:  address.String(),
+									Protocol: core.SocketAddress_TCP,
+									PortSpecifier: &core.SocketAddress_PortValue{
+										PortValue: uint32(svc.Port),
 									},
 								},
 							},
 						},
-					},
-					HealthStatus: core.HealthStatus_HEALTHY,
-				})
-			}
-			done <- true
-		}()
-
-		err := mdns.Query(&mdns.QueryParam{
-			Service:             mdnsService,
-			Domain:              "local",
-			Timeout:             2 * time.Second,
-			Entries:             entries,
-			WantUnicastResponse: false,
-			DisableIPv4:         false,
-			DisableIPv6:         true,
-		})
-		close(entries)
-
-		if err != nil {
-			log.Errorf("could not lookup service: %v", err)
-			continue
-		}
-		<-done
-
-		eds := []types.Resource{
-			&endpoint.ClusterLoadAssignment{
-				ClusterName: clusterName,
-				Endpoints: []*ep.LocalityLbEndpoints{{
-					Locality: &core.Locality{
-						Region: "local",
-					},
-					LbEndpoints:         lbendpoints,
-					LoadBalancingWeight: &wrapperspb.UInt32Value{Value: 1000},
-				}},
-			},
-		}
-
-		cls := []types.Resource{
-			&cluster.Cluster{
-				Name:                 clusterName,
-				LbPolicy:             cluster.Cluster_ROUND_ROBIN,
-				ClusterDiscoveryType: &cluster.Cluster_Type{Type: cluster.Cluster_EDS},
-				EdsClusterConfig: &cluster.Cluster_EdsClusterConfig{
-					EdsConfig: &core.ConfigSource{
-						ConfigSourceSpecifier: &core.ConfigSource_Ads{},
+						Hostname: strings.TrimSuffix(svc.Hostname, "."),
 					},
 				},
+				HealthStatus: core.HealthStatus_HEALTHY,
+			})
+		}
+	}
+
+	return &endpoint.ClusterLoadAssignment{
+		ClusterName: name,
+		Endpoints: []*endpoint.LocalityLbEndpoints{{
+			Locality: &core.Locality{
+				Region: "local",
 			},
+			LbEndpoints:         endpoints,
+			LoadBalancingWeight: &wrapperspb.UInt32Value{Value: 1000},
+		}},
+	}
+}
+
+func resourcesHash(resources []types.Resource) uint64 {
+	hasher := xxhash.New()
+	var buf []byte
+
+	for _, resource := range resources {
+		buf, _ = proto.MarshalOptions{
+			Deterministic: true,
+		}.MarshalAppend(buf, resource)
+		hasher.Write(buf)
+		hasher.Write([]byte{0})
+		buf = buf[:0]
+	}
+
+	return hasher.Sum64()
+}
+
+func generateResponse(req *discovery.DiscoveryRequest, resources []types.Resource) *cache.RawResponse {
+	sort.Slice(resources, func(i, j int) bool {
+		a := cache.GetResourceName(resources[i])
+		b := cache.GetResourceName(resources[j])
+		return a < b
+	})
+
+	hash := resourcesHash(resources)
+	version := fmt.Sprintf("%x", hash)
+
+	resourcesWithTTL := make([]types.ResourceWithTTL, 0, len(resources))
+	for _, resource := range resources {
+		resourcesWithTTL = append(resourcesWithTTL, types.ResourceWithTTL{Resource: resource, TTL: nil})
+	}
+	return &cache.RawResponse{
+		Request:   req,
+		Version:   version,
+		Resources: resourcesWithTTL,
+		Heartbeat: false,
+		Ctx:       context.TODO(),
+	}
+}
+
+func (c *cach) CreateWatch(req *discovery.DiscoveryRequest, state stream.StreamState, resp chan cache.Response) (cancel func()) {
+	c.log.Debug("CreateWatch", zap.Any("req", req))
+
+	ctx := context.Background()
+
+	switch req.TypeUrl {
+	case resource.ListenerType:
+		var resources []types.ResourceWithTTL
+		for _, name := range req.ResourceNames {
+			hcRds := &hcm.HttpConnectionManager_Rds{
+				Rds: &hcm.Rds{
+					RouteConfigName: name,
+					ConfigSource: &core.ConfigSource{
+						ResourceApiVersion: core.ApiVersion_V3,
+						ConfigSourceSpecifier: &core.ConfigSource_Ads{
+							Ads: &core.AggregatedConfigSource{},
+						},
+					},
+				},
+			}
+
+			hff := &router.Router{}
+			tctx, err := anypb.New(hff)
+			if err != nil {
+				continue
+			}
+
+			manager := &hcm.HttpConnectionManager{
+				CodecType:      hcm.HttpConnectionManager_AUTO,
+				RouteSpecifier: hcRds,
+				HttpFilters: []*hcm.HttpFilter{{
+					Name: wellknown.Router,
+					ConfigType: &hcm.HttpFilter_TypedConfig{
+						TypedConfig: tctx,
+					},
+				}},
+			}
+
+			pbst, err := anypb.New(manager)
+			if err != nil {
+				continue
+			}
+
+			l := &listener.Listener{
+				Name: name,
+				ApiListener: &listener.ApiListener{
+					ApiListener: pbst,
+				},
+			}
+			resources = append(resources, types.ResourceWithTTL{Resource: l})
 		}
 
-		rds := []types.Resource{
-			&route.RouteConfiguration{
-				Name:             routeConfigName,
+		if req.VersionInfo == "" {
+			resp <- &cache.RawResponse{
+				Request:   req,
+				Version:   "1",
+				Resources: resources,
+				Heartbeat: false,
+				Ctx:       context.TODO(),
+			}
+		}
+		return func() {}
+	case resource.RouteType:
+		var resources []types.ResourceWithTTL
+		for _, routeName := range req.ResourceNames {
+			route := &route.RouteConfiguration{
+				Name:             routeName,
 				ValidateClusters: &wrapperspb.BoolValue{Value: true},
 				VirtualHosts: []*route.VirtualHost{{
-					Name:    virtualHostName,
-					Domains: []string{listenerName},
+					Name:    routeName,
+					Domains: []string{routeName},
 					Routes: []*route.Route{{
 						Match: &route.RouteMatch{
 							PathSpecifier: &route.RouteMatch_Prefix{
@@ -258,91 +274,146 @@ func main() {
 						Action: &route.Route_Route{
 							Route: &route.RouteAction{
 								ClusterSpecifier: &route.RouteAction_Cluster{
-									Cluster: clusterName,
+									Cluster: routeName,
 								},
 							},
 						},
 					},
 					},
 				}},
-			},
+			}
+			resources = append(resources, types.ResourceWithTTL{Resource: route})
 		}
-
-		hcRds := &hcm.HttpConnectionManager_Rds{
-			Rds: &hcm.Rds{
-				RouteConfigName: routeConfigName,
-				ConfigSource: &core.ConfigSource{
-					ResourceApiVersion: core.ApiVersion_V3,
-					ConfigSourceSpecifier: &core.ConfigSource_Ads{
-						Ads: &core.AggregatedConfigSource{},
+		if req.VersionInfo == "" {
+			resp <- &cache.RawResponse{
+				Request:   req,
+				Version:   "1",
+				Resources: resources,
+				Heartbeat: false,
+				Ctx:       context.TODO(),
+			}
+		}
+		return func() {}
+	case resource.ClusterType:
+		var resources []types.ResourceWithTTL
+		for _, clusterName := range req.ResourceNames {
+			cluster := &cluster.Cluster{
+				Name:                 clusterName,
+				LbPolicy:             cluster.Cluster_ROUND_ROBIN,
+				ClusterDiscoveryType: &cluster.Cluster_Type{Type: cluster.Cluster_EDS},
+				EdsClusterConfig: &cluster.Cluster_EdsClusterConfig{
+					EdsConfig: &core.ConfigSource{
+						ConfigSourceSpecifier: &core.ConfigSource_Ads{},
 					},
 				},
-			},
+			}
+			resources = append(resources, types.ResourceWithTTL{Resource: cluster})
+		}
+		if req.VersionInfo == "" {
+			resp <- &cache.RawResponse{
+				Request:   req,
+				Version:   "1",
+				Resources: resources,
+				Heartbeat: false,
+				Ctx:       context.TODO(),
+			}
+		}
+		return func() {}
+	case resource.EndpointType:
+		services := req.ResourceNames
+		var resources []types.Resource
+
+		updates := make(chan *endpoint.ClusterLoadAssignment)
+		current := make(map[string]*endpoint.ClusterLoadAssignment)
+		ctx, cancel := context.WithCancel(ctx)
+		g, ctx := errgroup.WithContext(ctx)
+		for _, svc := range services {
+			svc := svc
+			mdnsService := "_" + svc + "._tcp.local."
+			subscription := c.browser.FullSubscribe(mdnsService)
+			instances := <-subscription.Stream
+			current[svc] = servicesToClusterLoadAssignment(svc, instances)
+			g.Go(func() error {
+				defer subscription.Close()
+				for {
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case instances := <-subscription.Stream:
+						updates <- servicesToClusterLoadAssignment(svc, instances)
+					}
+				}
+			})
 		}
 
-		hff := &router.Router{}
-		tctx, err := anypb.New(hff)
-		if err != nil {
-			log.Errorf("could not unmarshall router: %v", err)
-			continue
+		for _, cluster := range current {
+			resources = append(resources, cluster)
 		}
 
-		manager := &hcm.HttpConnectionManager{
-			CodecType:      hcm.HttpConnectionManager_AUTO,
-			RouteSpecifier: hcRds,
-			HttpFilters: []*hcm.HttpFilter{{
-				Name: wellknown.Router,
-				ConfigType: &hcm.HttpFilter_TypedConfig{
-					TypedConfig: tctx,
-				},
-			}},
+		response := generateResponse(req, resources)
+		if req.VersionInfo != response.Version {
+			resp <- response
 		}
 
-		pbst, err := anypb.New(manager)
-		if err != nil {
-			log.Errorf("could not unmarshall manager: %v", err)
-			continue
+		go func() {
+			for update := range updates {
+				current[update.ClusterName] = update
+				var resources []types.Resource
+				for _, cluster := range current {
+					resources = append(resources, cluster)
+				}
+				resp <- generateResponse(req, resources)
+			}
+		}()
+
+		return func() {
+			cancel()
+			g.Wait()
+			close(updates)
 		}
+	}
+	return nil
+}
 
-		l := []types.Resource{
-			&listener.Listener{
-				Name: listenerName,
-				ApiListener: &lv2.ApiListener{
-					ApiListener: pbst,
-				},
-			},
+func (*cach) Fetch(ctx context.Context, req *discovery.DiscoveryRequest) (cache.Response, error) {
+	return nil, fmt.Errorf("unimplemented")
+}
+
+func main() {
+	flag.Parse()
+
+	config := zap.NewDevelopmentConfig()
+	config.Level = zap.NewAtomicLevelAt(zap.InfoLevel)
+	log, err := config.Build()
+	if err != nil {
+		panic(err)
+	}
+
+	browser := dnssdbrowser.NewBrowser().SetLogger(log)
+	ctx, cancel := context.WithCancelCause(context.Background())
+	go func() {
+		for {
+			socket, err := net.ListenMulticastUDP("udp", nil, &net.UDPAddr{IP: net.IPv4(224, 0, 0, 251), Port: 5353})
+			if err != nil {
+				cancel(err)
+				log.Error("Failed to listen", zap.Error(err))
+				return
+			}
+
+			browser.Listen(socket)
 		}
+	}()
 
-		// TODO: only increment version if we actually changed something
-		version++
-		resources := make(map[resource.Type][]types.Resource, 4)
-		resources[resource.ClusterType] = cls
-		resources[resource.ListenerType] = l
-		resources[resource.RouteType] = rds
-		resources[resource.EndpointType] = eds
+	log.Info("Starting xDS-mDNS server", zap.String("address", address))
 
-		log.Printf("%+v", resources)
+	cb := &callbacks{}
+	cache := &cach{
+		browser: browser,
+		log:     log,
+	}
+	srv := xds.NewServer(ctx, cache, cb)
 
-		snap, err := cachev3.NewSnapshot(fmt.Sprint(version), resources)
-		if err != nil {
-			log.Errorf("could not create snapshot: %v", err)
-			continue
-		}
-
-		// cant get the consistent snapshot thing working anymore...
-		// https://github.com/envoyproxy/go-control-plane/issues/556
-		// https://github.com/envoyproxy/go-control-plane/blob/main/pkg/cache/v3/snapshot.go#L110
-		// if err := snap.Consistent(); err != nil {
-		// 	log.Errorf("snapshot inconsistency: %+v\n%+v", snap, err)
-		// 	os.Exit(1)
-		// }
-
-		err = cache.SetSnapshot(ctx, "", snap)
-		if err != nil {
-			log.Errorf("could not create snapshot: %v", err)
-			continue
-		}
-
-		time.Sleep(5 * time.Second)
+	if err := runServer(ctx, srv); err != nil {
+		log.Fatal("Failed to start server", zap.Error(err))
 	}
 }
