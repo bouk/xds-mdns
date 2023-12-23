@@ -755,7 +755,10 @@ func (b *Browser) servicesByName(serviceName string) []Service {
 		if svc.Deadline.Before(time.Now()) {
 			continue
 		}
-		instanceInfo := b.instances[instanceName]
+		instanceInfo, ok := b.instances[instanceName]
+		if !ok {
+			continue
+		}
 		service := b.buildService(serviceName, instanceName, instanceInfo)
 		services = append(services, service)
 	}
@@ -795,12 +798,7 @@ func (b *Browser) addresses(hostname string) []netip.Addr {
 
 func (b *Browser) streamChange(changeType ChangeType, service Service) {
 	name := service.ServiceName
-	listeners := b.activeQueries[name]
-	if len(listeners) == 0 {
-		return
-	}
-
-	for _, listener := range listeners {
+	for _, listener := range b.activeQueries[name] {
 		listener.Push(Change{
 			Type:    changeType,
 			Service: service,
